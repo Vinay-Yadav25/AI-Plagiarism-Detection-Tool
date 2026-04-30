@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+streamlit
+python-multipart
+pdfplumber
+python-docx
+scikit-learn
+transformers
+torch
+numpy
+pandas
