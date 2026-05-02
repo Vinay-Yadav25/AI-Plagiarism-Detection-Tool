@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import base64
 
-API_URL = "https://ai-plagiarism-detection-tool-5ew5.onrender.com"
+API_URL = "http://localhost:8000"
 
 st.set_page_config(page_title="AI & Plagiarism Detector", page_icon="🔍", layout="wide")
 
