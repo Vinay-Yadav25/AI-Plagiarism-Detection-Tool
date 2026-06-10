@@ -139,7 +139,7 @@ st.markdown("""
         border:1px solid #2A3550; border-radius:99px; padding:5px 16px;
         font-family:'Space Grotesk',sans-serif; font-size:11px; color:#818CF8;
         letter-spacing:.1em; text-transform:uppercase; margin-bottom:18px;">
-        🛡️ &nbsp;TextGuard — Forensic Text Analysis
+        🔍 &nbsp;AI-Plagiarism-Tool
     </div>
     <h1 style="font-family:'Space Grotesk',sans-serif; font-size:clamp(28px,4.5vw,50px);
         font-weight:700; color:#E2E8F0; margin:0 0 10px; letter-spacing:-.02em; line-height:1.1;">
