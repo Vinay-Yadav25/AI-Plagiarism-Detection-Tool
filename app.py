@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="TextGuard — AI Detection",
-    page_icon="🛡️",
+    page_title="AI Plagiarism Tool",
+    page_icon="🔍🔍",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
