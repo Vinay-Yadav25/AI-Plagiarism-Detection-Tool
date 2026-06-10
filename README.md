@@ -1,4 +1,4 @@
-# TextGuard 🛡️
+# AI-Plagiarism-Detection-Tool 🛡️
 
 I built this because I was tired of every AI detection tool either requiring an API key, sending your text to some server, or making you download a 3GB model just to check a paragraph. TextGuard runs completely on your machine — no internet after install, no accounts, no keys, nothing phoning home.
 
