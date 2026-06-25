@@ -14,7 +14,7 @@ if _ROOT not in sys.path:
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI-Plagiarism-Tool",
+    page_title="TextGuard — AI Detection",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -69,7 +69,7 @@ with st.sidebar:
     st.markdown("""
     <div style="padding:20px 4px 12px;">
         <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;color:#E2E8F0;">
-            🔍 AI-Plagiarism-Tool
+            🛡️ TextGuard
         </div>
         <div style="font-size:11px;color:#94A3B8;margin-top:2px;">AI Detection & Analysis v2</div>
     </div>""", unsafe_allow_html=True)
@@ -106,6 +106,12 @@ def load_analyzer():
 def load_file_processor():
     from utils.file_handler import process_file
     return process_file
+
+# Cache analysis results by text hash — avoids re-running on every Streamlit rerun
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_analyze(text: str) -> dict:
+    fn = load_analyzer()
+    return fn(text)
 
 CLS_STYLE = {
     "AI Generated":      ("#EF4444", "#200A0A"),
@@ -289,9 +295,9 @@ def render_readability(R):
           <div style="font-size:10px;color:{fog_c};">Grade {fog:.0f}</div>
         </div>
         <div style="text-align:center;">
-          <div style="font-size:26px;font-weight:700;color:#818CF8;font-family:'Space Grotesk',sans-serif;">{rd['entropy']:.2f}</div>
-          <div style="font-size:11px;color:#94A3B8;">Entropy (bits)</div>
-          <div style="font-size:10px;color:#818CF8;">Information density</div>
+          <div style="font-size:26px;font-weight:700;color:#818CF8;font-family:'Space Grotesk',sans-serif;">{rd['msttr']:.3f}</div>
+          <div style="font-size:11px;color:#94A3B8;">MSTTR</div>
+          <div style="font-size:10px;color:#818CF8;">Lexical diversity</div>
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
@@ -326,9 +332,9 @@ def make_report(R, label=""):
         f"\nSUMMARY\n{R['summary']}",
         f"\nPERPLEXITY\nOverall: {p['overall']} (Bigram: {p['bigram']}, Trigram: {p['trigram']})",
         f"Interpretation: {p['interpretation']}",
-        f"\nREADABILITY\nFlesch: {rd['flesch']}  |  Gunning Fog: {rd['fog_index']}  |  Entropy: {rd['entropy']}",
+        f"\nREADABILITY\nFlesch: {rd['flesch']}  |  Gunning Fog: {rd['fog_index']}  |  MSTTR: {rd['msttr']}",
         f"\nSTATS\nWords: {s['word_count']}  |  Sentences: {s['sentence_count']}",
-        f"TTR: {s['ttr']}  |  AI Phrases: {s['ai_phrases_found']}",
+        f"TTR: {s['ttr']}  |  AI Phrases: {s.get('formal_phrases',0) + s.get('fake_casual',0)}",
         f"Avg Sentence Length: {s['avg_sentence_len']} words",
         f"\nFLAGGED SENTENCES ({len(R['flagged_sentences'])})",
     ]
@@ -348,7 +354,7 @@ def full_results(R, label=""):
     with m2: st.metric("Perplexity",        f"{R['perplexity']['overall']:.1f}")
     with m3: st.metric("Human-likeness",    f"{R['perplexity']['normalized']:.0f}/100")
     with m4: st.metric("Words",             R['stats']['word_count'])
-    with m5: st.metric("AI Phrases",        R['stats']['ai_phrases_found'])
+    with m5: st.metric("AI Phrases",        R['stats'].get('formal_phrases', 0) + R['stats'].get('fake_casual', 0))
     with m6: st.metric("Flagged Sentences", len(R['flagged_sentences']))
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
@@ -375,9 +381,9 @@ def full_results(R, label=""):
               color:#E2E8F0;margin-bottom:12px;">📋 Text Stats</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#94A3B8;">
             <div>Avg Sentence Length<br><strong style="color:#E2E8F0;">{s['avg_sentence_len']} words</strong></div>
-            <div>Passive Voice Rate<br><strong style="color:#E2E8F0;">{s['passive_ratio']:.2f}/sent</strong></div>
+            <div>Fragment Ratio<br><strong style="color:#E2E8F0;">{round(s['fragment_ratio']*100)}%</strong></div>
             <div>Lexical Diversity (TTR)<br><strong style="color:#E2E8F0;">{s['ttr']:.3f}</strong></div>
-            <div>Opener Diversity<br><strong style="color:#E2E8F0;">{round(s['starter_diversity']*100)}%</strong></div>
+            <div>Tense Mix Score<br><strong style="color:#E2E8F0;">{s['tense_mix']:.2f}</strong></div>
           </div>
         </div>""", unsafe_allow_html=True)
 
@@ -449,7 +455,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-analyze_fn = load_analyzer()
 process_fn = load_file_processor()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,8 +501,8 @@ if "Single" in mode:
         st.markdown("<hr style='border:none;border-top:1px solid #2A3550;margin:28px 0;'>",
                     unsafe_allow_html=True)
         with st.spinner("Running analysis…"):
-            R = analyze_fn(input_text)
-            R["_input_text"] = input_text
+            R = cached_analyze(input_text)
+            R = dict(R); R["_input_text"] = input_text
         if "error" in R: st.error(R["error"])
         else: full_results(R, file_label)
 
@@ -538,8 +543,8 @@ else:
             st.warning("Please fill in both text boxes.")
         else:
             with st.spinner("Analyzing both texts…"):
-                Ra = analyze_fn(text_a.strip()); Ra["_input_text"] = text_a.strip()
-                Rb = analyze_fn(text_b.strip()); Rb["_input_text"] = text_b.strip()
+                Ra = dict(cached_analyze(text_a.strip())); Ra["_input_text"] = text_a.strip()
+                Rb = dict(cached_analyze(text_b.strip())); Rb["_input_text"] = text_b.strip()
 
             st.markdown("<hr style='border:none;border-top:1px solid #2A3550;margin:24px 0;'>",
                         unsafe_allow_html=True)
@@ -604,8 +609,8 @@ else:
               + cmp_row("Ppl Std Dev (lower=AI)",f"{Ra['perplexity']['ppl_std']:.1f}",     f"{Rb['perplexity']['ppl_std']:.1f}",     True)
               + cmp_row("Flesch Ease",           f"{Ra['readability']['flesch']:.0f}",     f"{Rb['readability']['flesch']:.0f}",     False)
               + cmp_row("Gunning Fog (higher=AI)",f"{Ra['readability']['fog_index']:.1f}", f"{Rb['readability']['fog_index']:.1f}",  True)
-              + cmp_row("Entropy (lower=AI)",    f"{Ra['readability']['entropy']:.2f}",    f"{Rb['readability']['entropy']:.2f}",    False)
-              + cmp_row("AI Phrases",            Ra['stats']['ai_phrases_found'],          Rb['stats']['ai_phrases_found'],          True)
+              + cmp_row("MSTTR (lower=AI)",      f"{Ra['readability']['msttr']:.3f}",      f"{Rb['readability']['msttr']:.3f}",      False)
+              + cmp_row("AI Phrases",            Ra['stats'].get('formal_phrases',0)+Ra['stats'].get('fake_casual',0), Rb['stats'].get('formal_phrases',0)+Rb['stats'].get('fake_casual',0), True)
               + cmp_row("Flagged Sentences",     len(Ra['flagged_sentences']),             len(Rb['flagged_sentences']),             True)
               + cmp_row("TTR (lower=AI)",        f"{Ra['stats']['ttr']:.3f}",              f"{Rb['stats']['ttr']:.3f}",              False)
             )

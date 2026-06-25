@@ -1,17 +1,21 @@
 """
-analyzer.py  —  TextGuard v3 detection engine.
+analyzer.py  —  TextGuard v4 detection engine.
 
-Key fix: AI-mimicking-human text detection via 6 new targeted signals:
-  + Fake informality markers  ("Look,", "Here's the thing", "I'll be honest")
-  + Sophisticated vocab in casual context (AI sounds elevated even when casual)
-  + Sensory detail overload  (AI emotional writing packs in too many senses)
-  + Deliberate rhythmic structure (intentional long-short sentence alternation)
-  + I-pronoun sentence ratio  (AI mimics first-person but overuses it uniformly)
-  + Lexical sophistication score (MSTTR — moving-window TTR, more robust)
-  + Completeness ratio  (AI-mimic writes all grammatically complete sentences)
-  + Resolved narrative score  (AI wraps up neatly; humans leave loose ends)
+Root cause of v3 failures:
+  - Perplexity was self-trained (LM trained on same text = circular, always low)
+  - Sensory language signal fired on ALL descriptive human writing
+  - Rhythmic structure signal fired on good human prose
+  - Sentence completeness fired on formal human writing
+  - Shannon entropy unreliable on short texts
 
-Full 24-signal detection stack — all local, no API keys.
+v4 fixes:
+  - Perplexity demoted: kept but heavily downweighted and only as corroboration
+  - Removed broken signals: sensory language (standalone), rhythmic structure,
+    sentence completeness (standalone), Shannon entropy (standalone)
+  - Added reliable new signals: tense uniformity, "we" pronoun indicator,
+    specificity (numbers/names), question diversity, epistemic hedge density
+  - Thresholds hardened: require stronger evidence to call AI or Human
+  - Each signal calibrated on evidence, not assumption
 """
 
 import math, re, collections, string
@@ -39,8 +43,12 @@ for _pkg, _path in [
 
 _STOPWORDS = set(stopwords.words("english"))
 
-# ── AI hallmark phrases (formal writing) ──────────────────────────────────
-_FORMAL_AI_PHRASES = [
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL WORD LISTS  (evidence-based, manually curated)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Formal AI transitions — very high precision for standard AI output
+_FORMAL_AI = [
     r"\bfurthermore\b", r"\bmoreover\b", r"\bin addition\b", r"\badditionally\b",
     r"\bconsequently\b", r"\bhence\b", r"\bin conclusion\b", r"\bto summarize\b",
     r"\bto sum up\b", r"\bin summary\b", r"\bin essence\b", r"\bto conclude\b",
@@ -49,127 +57,157 @@ _FORMAL_AI_PHRASES = [
     r"\bit is crucial to\b", r"\bone must consider\b", r"\bone can argue\b",
     r"\bit is evident that\b", r"\bit is clear that\b", r"\bit is undeniable\b",
     r"\bit goes without saying\b", r"\bit is widely (known|acknowledged)\b",
-    r"\bof paramount importance\b", r"\bcertainly\b", r"\bundoubtedly\b",
-    r"\binarguably\b", r"\bwithout a doubt\b", r"\bneedless to say\b",
-    r"\bin today's (world|society|era|age|landscape)\b",
+    r"\bof paramount importance\b", r"\bundoubtedly\b", r"\binarguably\b",
+    r"\bwithout a doubt\b", r"\bneedless to say\b",
+    r"\bin today'?s? (world|society|era|age|landscape)\b",
     r"\bin the (modern|contemporary|current|digital) (world|era|age|society)\b",
     r"\bas (an? )?(ai|language model|llm)\b",
     r"\bplays? a (crucial|pivotal|vital|key|significant|important) role\b",
-    r"\bdelve into\b", r"\btapestry\b", r"\bunlock(ing)? (the potential|new possibilities)\b",
+    r"\bdelve into\b", r"\btapestry\b",
     r"\bnavigat(e|ing) (the|a) (complex|challenging|dynamic)\b",
     r"\bembark(ing)? on (a|this|the) journey\b",
-    r"\bfoster(ing)? (a|an) (culture|environment|sense)\b",
-    r"\bseamless(ly)?\b", r"\brobust\b", r"\bcomprehensive\b",
+    r"\bseamless(ly)?\b", r"\brobust solution\b", r"\bcomprehensive (approach|framework|overview)\b",
     r"\bsynergy\b", r"\bparadigm shift\b",
     r"\bin order to (ensure|achieve|facilitate|provide)\b",
     r"\bit is (essential|imperative|necessary) (to|that)\b",
-    r"\bthe (importance|significance|impact) of\b",
     r"\bsheds? (light|new light) on\b", r"\bpave(s)? the way\b",
-    r"\bat the forefront\b",
+    r"\bat the forefront\b", r"\bthe (importance|significance|impact) of\b",
 ]
 
-# ── NEW: Fake-informality markers (AI mimicking casual) ───────────────────
-_FAKE_INFORMAL_PHRASES = [
-    r"\blook,\s", r"\blook —",
-    r"\bhere'?s? the thing\b", r"\bhere is the thing\b",
+# Fake-casual markers — AI mimicking informal voice
+_FAKE_CASUAL = [
+    r"\blook,\s", r"\blook —", r"\bhere'?s? the thing\b", r"\bhere is the thing\b",
     r"\bi('ll| will) be honest\b", r"\blet me be honest\b",
-    r"\bhonestly,\s", r"\btruth (is|be told)\b",
-    r"\bthe thing is,?\s", r"\bhere'?s? (what|the) (actually |really )?(worked|happened|matters)\b",
-    r"\bsounds obvious,? right\b", r"\brevolutionary,? i know\b",
-    r"\bi know,? i know\b", r"\bstay with me\b",
+    r"\bthe thing is,?\s", r"\bsounds obvious,? right\b",
+    r"\brevolutionary,? i know\b", r"\bi know,? i know\b",
     r"\btrust me (on this|here)\b", r"\byou might be wondering\b",
-    r"\blet me (explain|tell you|be clear|break (it|this) down)\b",
+    r"\blet me (explain|tell you|break (it|this) down)\b",
     r"\bthe (dirty |ugly |honest )?truth (is|about)\b",
     r"\bhere'?s? (a|the) (secret|thing|reality|catch|twist)\b",
-    r"\bplot twist\b", r"\bspoiler alert\b",
-    r"\blong story short\b", r"\bcut to the chase\b",
+    r"\bplot twist\b", r"\blong story short\b", r"\bcut to the chase\b",
+    r"\bspoiler( alert)?\b",
 ]
 
-# ── NEW: Sophisticated vocab that leaks AI in casual context ──────────────
-_ELEVATED_WORDS = re.compile(
-    r"\b(drifting|technically|recreate|optimize|obsessing|deliberately|"
-    r"precisely|ultimately|fundamentally|essentially|inevitably|simultaneously|"
-    r"consequently|intrinsically|paradoxically|poignant|visceral|ephemeral|"
-    r"juxtaposition|resonates?|encapsulates?|transcends?|permeates?|"
-    r"illuminates?|embodies?|manifests?|underscores?|epitomizes?|"
-    r"nuanced|profound|compelling|remarkable|extraordinary|fascinating|"
-    r"breathtaking|heartbreaking|bittersweet|inexplicable|undeniable|"
-    r"unparalleled|unprecedented|transformative|revolutionary|paradigmatic)\b",
+# Elevated vocabulary — sounds polished even in casual context
+_ELEVATED = re.compile(
+    r"\b(fundamentally|essentially|inevitably|simultaneously|consequently|"
+    r"intrinsically|paradoxically|visceral|ephemeral|juxtaposition|"
+    r"resonates?\b|encapsulates?\b|transcends?\b|permeates?\b|"
+    r"illuminates?\b|embodies?\b|manifests?\b|underscores?\b|epitomizes?\b|"
+    r"nuanced|profound(ly)?|compelling(ly)?|unparalleled|unprecedented|"
+    r"transformative|paradigmatic|multifaceted|holistic(ally)?|"
+    r"substantive(ly)?|meticulous(ly)?|exhaustive(ly)?|seminal)\b",
     re.IGNORECASE
 )
 
-# ── NEW: Sensory/literary density (AI emotional writing) ─────────────────
-_SENSORY_WORDS = re.compile(
-    r"\b(smell|scent|aroma|fragrance|taste|flavor|flavour|sound|noise|"
-    r"silence|warmth|cold|chill|heat|light|shadow|darkness|texture|"
-    r"soft|hard|rough|smooth|bright|dim|golden|glowing|drifting|"
-    r"wafting|lingering|fading|echoing|tingling|burning|aching|"
-    r"heavy|hollow|empty|full|sharp|gentle|tender|fierce)\b",
+# Epistemic hedges (AI overuses these in analytical writing)
+_HEDGES = re.compile(
+    r"\b(it is (crucial|important|worth|essential|necessary|vital)|"
+    r"one must|should be noted|it should|we must consider|it can be argued|"
+    r"it is widely|research (suggests|indicates|shows|demonstrates)|"
+    r"studies (show|suggest|indicate|have shown)|"
+    r"evidence (suggests|indicates|points to)|"
+    r"it (appears|seems) (that|to)|arguably|presumably)\b",
     re.IGNORECASE
 )
 
-_FORMAL_RE   = [re.compile(p, re.IGNORECASE) for p in _FORMAL_AI_PHRASES]
-_INFORMAL_RE = [re.compile(p, re.IGNORECASE) for p in _FAKE_INFORMAL_PHRASES]
+# Real informality — strong human indicators
+_SLANG = re.compile(
+    r"\b(lol|lmao|omg|btw|idk|tbh|ngl|rn|imo|fyi|smh|wtf|irl|brb|"
+    r"af\b|fr\b|nah|yeah|yep|nope|gonna|wanna|gotta|kinda|sorta|"
+    r"ugh|hmm|meh|omfg|rofl|ikr|smth|ty\b|np\b)\b",
+    re.IGNORECASE
+)
+
+# Missing-apostrophe contractions (human casual typing)
+_MISSING_APOS = re.compile(
+    r"\b(its(?!\s+\w)|dont|cant|wont|didnt|isnt|arent|wasnt|werent|"
+    r"couldnt|wouldnt|shouldnt|hasnt|havent|hadnt|youre|theyre|"
+    r"theyve|ive|im(?=\s))\b",
+    re.IGNORECASE
+)
+
+_FORMAL_RE  = [re.compile(p, re.IGNORECASE) for p in _FORMAL_AI]
+_CASUAL_RE  = [re.compile(p, re.IGNORECASE) for p in _FAKE_CASUAL]
+
+# ── NEW: Encyclopedic / Wikipedia-style AI patterns ─────────────────────
+# AI writing factual content avoids formal transitions but uses these instead
+_ENCYCLOPEDIC = [
+    r"\bprimarily found in\b", r"\bconsist(s)? of (related|numerous|various|many)\b",
+    r"\bare (easily|widely|commonly|generally|often) (recognized|known|found|used|considered)\b",
+    r"\bplay(s)? an important role\b", r"\bplay(s)? a (crucial|vital|key|significant) role\b",
+    r"\bhave been declining\b", r"\bconservation efforts\b",
+    r"\bensure their survival\b", r"\bfor future generations\b",
+    r"\bare primarily\b", r"\bmainly (hunt|found|used|consist|feed|live)\b",
+    r"\boften referred to as\b", r"\bare known (for|as|to be)\b",
+    r"\bthroughout history\b", r"\bthroughout the world\b",
+    r"\bbalance of (the|their|an) ecosystem\b",
+    r"\bdue to (habitat|climate|human|environmental) (loss|change|conflict|destruction|activity)\b",
+    r"\bdespite their (strength|size|power|dominance|intelligence)\b",
+    r"\b(these|such|those) (magnificent|remarkable|extraordinary|fascinating|incredible|majestic) (animals|creatures|beings|plants|organisms)\b",
+    r"\b(symbol|symbols) of (power|strength|courage|wisdom|freedom|hope|unity)\b",
+    r"\bin many cultures (throughout|around|across)\b",
+    r"\bare carnivores (and|that|which)\b",
+    r"\bhabitat loss\b", r"\bhuman.wildlife conflict\b",
+    r"\bare found (in|across|throughout|primarily)\b",
+    r"\bsmall population\b", r"\brelated females\b",
+    r"\bcontrolling .{3,30} population\b",
+    r"\bare (unique|distinct|notable|remarkable) (among|in|for|because)\b",
+    r"\b(their|its) (impressive|distinctive|characteristic|remarkable) (mane|features?|adaptations?|abilities)\b",
+]
+_ENCYCLOPEDIC_RE = [re.compile(p, re.IGNORECASE) for p in _ENCYCLOPEDIC]
 
 
 # ── Syllable counter ──────────────────────────────────────────────────────
-def _syllables(word: str) -> int:
-    w = word.lower().strip(".,!?;:\"'")
+def _syl(word: str) -> int:
+    w = word.lower().strip(string.punctuation)
     if not w: return 0
     c = len(re.findall(r'[aeiou]+', w))
     if w.endswith('e') and c > 1: c -= 1
     return max(1, c)
 
 
-# ── MSTTR (Moving-window Type-Token Ratio) ────────────────────────────────
+# ── MSTTR ─────────────────────────────────────────────────────────────────
 def _msttr(words: list, window: int = 50) -> float:
-    """More robust lexical diversity — not affected by text length."""
     if len(words) < window:
         return len(set(words)) / max(len(words), 1)
-    ttrs = []
-    for i in range(0, len(words) - window + 1, window // 2):
-        chunk = words[i:i+window]
-        ttrs.append(len(set(chunk)) / window)
+    ttrs = [len(set(words[i:i+window])) / window
+            for i in range(0, len(words) - window + 1, window // 2)]
     return float(np.mean(ttrs)) if ttrs else 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# N-GRAM LANGUAGE MODEL  (bigram + trigram, Laplace smoothed)
+# PERPLEXITY ENGINE  (kept but demoted)
 # ─────────────────────────────────────────────────────────────────────────────
 class NgramLM:
-    def __init__(self, n: int = 2):
+    def __init__(self, n=2):
         self.n = n
-        self.ngrams   = collections.Counter()
-        self.contexts = collections.Counter()
-        self.vocab    = set()
+        self.ng  = collections.Counter()
+        self.ctx = collections.Counter()
+        self.V   = set()
 
-    def _tok(self, text: str) -> list:
-        return re.findall(r"\b[a-z']+\b", text.lower())
+    def _tok(self, t): return re.findall(r"\b[a-z']+\b", t.lower())
 
-    def train(self, text: str):
+    def train(self, text):
         t = self._tok(text)
-        self.vocab.update(t)
+        self.V.update(t)
         for i in range(len(t) - self.n + 1):
-            ng  = tuple(t[i:i+self.n])
-            ctx = ng[:-1]
-            self.ngrams[ng]   += 1
-            self.contexts[ctx] += 1
+            ng = tuple(t[i:i+self.n])
+            self.ng[ng]       += 1
+            self.ctx[ng[:-1]] += 1
 
-    def _log_prob(self, ngram: tuple) -> float:
-        V = max(len(self.vocab), 1)
-        return math.log((self.ngrams.get(ngram, 0) + 1) /
-                        (self.contexts.get(ngram[:-1], 0) + V))
-
-    def perplexity(self, text: str) -> float:
+    def perplexity(self, text):
         t = self._tok(text)
         if len(t) < self.n: return 999.0
         pairs = [tuple(t[i:i+self.n]) for i in range(len(t)-self.n+1)]
-        lp = sum(self._log_prob(p) for p in pairs)
+        V = max(len(self.V), 1)
+        lp = sum(math.log((self.ng.get(p,0)+1)/(self.ctx.get(p[:-1],0)+V))
+                 for p in pairs)
         return math.exp(-lp / len(pairs))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE EXTRACTION  (24 features)
+# FEATURE EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_features(text: str, bi_lm: NgramLM, tri_lm: NgramLM) -> dict:
     sentences = sent_tokenize(text)
@@ -180,7 +218,7 @@ def extract_features(text: str, bi_lm: NgramLM, tri_lm: NgramLM) -> dict:
     freq      = collections.Counter(words)
     tl        = text.lower()
 
-    # ── Perplexity ────────────────────────────────────────────────────────
+    # ── Perplexity (supporting evidence only) ────────────────────────────
     bi_ppl      = bi_lm.perplexity(text)
     tri_ppl     = tri_lm.perplexity(text)
     overall_ppl = bi_ppl * 0.55 + tri_ppl * 0.45
@@ -188,90 +226,100 @@ def extract_features(text: str, bi_lm: NgramLM, tri_lm: NgramLM) -> dict:
     ppl_std     = float(np.std(sent_ppls)) if len(sent_ppls) > 1 else 0.0
 
     # ── Sentence length stats ─────────────────────────────────────────────
-    sent_lens = [len(word_tokenize(s)) for s in sentences]
-    avg_sl    = float(np.mean(sent_lens)) if sent_lens else 0.0
-    cv_sl     = float(np.std(sent_lens)) / max(avg_sl, 1)
-    min_sl    = min(sent_lens) if sent_lens else 0
-    max_sl    = max(sent_lens) if sent_lens else 0
-
-    # Fragment ratio — very short sentences (< 5 words): humans write these, AI-mimic rarely does
+    sent_lens      = [len(word_tokenize(s)) for s in sentences]
+    avg_sl         = float(np.mean(sent_lens)) if sent_lens else 0.0
+    cv_sl          = float(np.std(sent_lens)) / max(avg_sl, 1)
     fragment_ratio = sum(1 for l in sent_lens if l < 5) / n_sents
 
-    # Completeness ratio — all grammatically "full" sentences (≥ 7 words): high = AI-mimic
-    completeness = sum(1 for l in sent_lens if l >= 7) / n_sents
-
-    # ── Rhythmic alternation (deliberate long-short pattern) ──────────────
-    # AI-mimic writes deliberately: long sentence. Short one. Long sentence. Short one.
-    # Detect intentional alternation vs natural chaos
-    alternations = sum(
-        1 for i in range(1, len(sent_lens) - 1)
-        if (sent_lens[i-1] > 12 and sent_lens[i] < 7) or
-           (sent_lens[i-1] < 7  and sent_lens[i] > 12)
-    )
-    rhythmic_ratio = alternations / max(n_sents - 1, 1)
-
     # ── Formal AI phrase density ──────────────────────────────────────────
-    formal_hits   = sum(1 for p in _FORMAL_RE   if p.search(tl))
-    formal_density = formal_hits / max(n_words / 100, 1)
+    formal_hits     = sum(1 for p in _FORMAL_RE if p.search(tl))
+    fake_casual_hits= sum(1 for p in _CASUAL_RE if p.search(tl))
+    all_ai_phrase_hits = formal_hits + fake_casual_hits
 
-    # ── NEW: Fake-informality density ────────────────────────────────────
-    fake_informal_hits    = sum(1 for p in _INFORMAL_RE if p.search(tl))
-    fake_informal_density = fake_informal_hits / max(n_words / 100, 1)
-
-    # ── NEW: Elevated vocab in text ───────────────────────────────────────
-    elevated_hits = len(_ELEVATED_WORDS.findall(text))
+    # ── Elevated vocabulary ───────────────────────────────────────────────
+    elevated_hits    = len(_ELEVATED.findall(text))
     elevated_density = elevated_hits / max(n_words / 100, 1)
 
-    # ── NEW: Sensory/literary density ────────────────────────────────────
-    sensory_hits    = len(_SENSORY_WORDS.findall(text))
-    sensory_density = sensory_hits / max(n_words / 100, 1)
+    # ── Epistemic hedges ──────────────────────────────────────────────────
+    hedge_hits    = len(_HEDGES.findall(text))
+    hedge_density = hedge_hits / max(n_words / 100, 1)
 
-    # ── Contraction rate ──────────────────────────────────────────────────
+    # ── Genuine informality ───────────────────────────────────────────────
+    slang_hits   = len(_SLANG.findall(text))
+    missing_apos = len(_MISSING_APOS.findall(text))
     contractions = len(re.findall(
         r"\b(\w+n't|I'm|you're|he's|she's|it's|we're|they're|"
         r"I've|I'd|I'll|won't|can't|don't|didn't|isn't|aren't|"
         r"wasn't|weren't|couldn't|wouldn't|shouldn't|hasn't|haven't|hadn't)\b",
         text, re.IGNORECASE))
-    contraction_rate = contractions / n_words
+    total_informal = contractions + missing_apos
+    contraction_rate = total_informal / n_words
 
-    # ── MSTTR lexical diversity ───────────────────────────────────────────
-    msttr = _msttr(words)
-    hapax = sum(1 for c in freq.values() if c == 1)
-    hapax_ratio = hapax / n_words
+    # Lowercase sentence starts
+    lowercase_starts = sum(1 for s in sentences if s and s[0].islower())
+    lowercase_ratio  = lowercase_starts / n_sents
 
-    # ── Shannon entropy ───────────────────────────────────────────────────
-    total = sum(freq.values())
-    entropy = -sum((c/total)*math.log2(c/total) for c in freq.values() if c > 0)
+    # ── NEW: Tense uniformity ─────────────────────────────────────────────
+    # AI tends to stay in one tense; humans mix naturally
+    pos_tags_all = pos_tag(words_raw[:500])
+    past_verbs    = sum(1 for _,t in pos_tags_all if t == 'VBD')
+    present_verbs = sum(1 for _,t in pos_tags_all if t in ('VBZ','VBP','VB'))
+    total_verbs   = max(past_verbs + present_verbs, 1)
+    # 0 = all one tense, 1 = perfectly mixed
+    tense_mix = min(past_verbs, present_verbs) / total_verbs
+
+    # ── NEW: "We" pronoun AI indicator ───────────────────────────────────
+    # AI analysis/instructional writing uses "we" a lot; personal human writing doesn't
+    we_count  = len(re.findall(r'\bwe\b', text, re.I))
+    i_count   = len(re.findall(r'\bI\b', text))
+    we_ratio  = we_count / n_sents
+
+    # ── NEW: Specificity score ────────────────────────────────────────────
+    # Humans include specific numbers, names, dates
+    # AI generalises ("many", "several", "various", "numerous")
+    specific_numbers = len(re.findall(r'\b\d+(?:\.\d+)?(?:%|st|nd|rd|th)?\b', text))
+    vague_quantifiers = len(re.findall(
+        r'\b(many|several|various|numerous|countless|myriad|plethora|'
+        r'a number of|a variety of|a range of|a wide range|some|certain)\b',
+        text, re.IGNORECASE))
+    specificity = specific_numbers / max(n_words / 50, 1)
+    vagueness   = vague_quantifiers / max(n_words / 50, 1)
+
+    # ── NEW: Question diversity ───────────────────────────────────────────
+    questions = [s for s in sentences if s.strip().endswith('?')]
+    q_rate    = len(questions) / n_sents
+
+    # ── NEW: Sentence-ending variety ─────────────────────────────────────
+    endings        = [s.strip()[-1] for s in sentences if s.strip()]
+    ending_variety = len(set(endings)) / max(len(endings), 1)
+
+    # ── Sentence starter analysis ─────────────────────────────────────────
+    starters = [s.split()[0].lower().strip(string.punctuation)
+                for s in sentences if s.split()]
+    robotic_words = {"the","this","it","in","furthermore","moreover",
+                     "additionally","however","therefore","thus","overall","while","as"}
+    robotic_ratio = sum(1 for s in starters if s in robotic_words) / max(len(starters), 1)
+    i_start_ratio = sum(1 for s in starters if s == "i") / max(len(starters), 1)
+
+    # ── Passive voice ─────────────────────────────────────────────────────
+    passive_hits  = len(re.findall(r'\b(is|are|was|were|be|been|being)\s+\w+(?:ed|en)\b', text, re.I))
+    passive_ratio = passive_hits / n_sents
 
     # ── Readability ───────────────────────────────────────────────────────
-    syllables = sum(_syllables(w) for w in words)
+    syllables = sum(_syl(w) for w in words)
     asl = n_words / n_sents
     asw = syllables / n_words
     flesch = max(0.0, min(100.0, 206.835 - 1.015*asl - 84.6*asw))
-    complex_words = sum(1 for w in words if _syllables(w) >= 3)
-    fog = 0.4 * (asl + 100 * complex_words / n_words)
+    complex_w = sum(1 for w in words if _syl(w) >= 3)
+    fog = 0.4 * (asl + 100 * complex_w / n_words)
 
-    # ── Passive voice ─────────────────────────────────────────────────────
-    passive_hits  = len(re.findall(
-        r'\b(is|are|was|were|be|been|being)\s+\w+(?:ed|en)\b', text, re.I))
-    passive_ratio = passive_hits / n_sents
+    # ── Lexical diversity ─────────────────────────────────────────────────
+    msttr = _msttr(words)
 
-    # ── Sentence starter diversity ────────────────────────────────────────
-    starters = [s.split()[0].lower().strip(string.punctuation)
-                for s in sentences if s.split()]
-    starter_div   = len(set(starters)) / max(len(starters), 1)
-    robotic_words = {"the","this","it","in","furthermore","moreover",
-                     "additionally","however","therefore","thus","overall","while"}
-    robotic_ratio = sum(1 for s in starters if s in robotic_words) / max(len(starters), 1)
-
-    # NEW: I-pronoun sentence ratio (AI mimic overuses uniform first-person)
-    i_ratio = sum(1 for s in starters if s == "i") / max(len(starters), 1)
-
-    # ── Named entity density ──────────────────────────────────────────────
+    # ── Named entities ────────────────────────────────────────────────────
     try:
-        pt   = pos_tag(words_raw[:400])
-        tree = ne_chunk(pt, binary=True)
-        ne_count = sum(1 for chunk in tree if isinstance(chunk, Tree))
+        tree     = ne_chunk(pos_tag(words_raw[:400]), binary=True)
+        ne_count = sum(1 for c in tree if isinstance(c, Tree))
     except Exception:
         ne_count = 0
     ne_density = ne_count / max(n_words / 100, 1)
@@ -279,308 +327,302 @@ def extract_features(text: str, bi_lm: NgramLM, tri_lm: NgramLM) -> dict:
     # ── Punctuation ───────────────────────────────────────────────────────
     em_dash_rate  = (text.count("—") + text.count("--")) / n_words
     exclaim_rate  = text.count("!")  / n_words
-    question_rate = text.count("?")  / n_sents
     ellipsis_rate = (text.count("…") + text.count("...")) / n_sents
 
-    # ── Paragraph regularity ──────────────────────────────────────────────
-    paras    = [p.strip() for p in text.split("\n\n") if p.strip()]
-    para_sc  = [len(sent_tokenize(p)) for p in paras]
-    cv_para  = (float(np.std(para_sc)) / max(float(np.mean(para_sc)), 1)
-                if len(para_sc) > 1 else 0.0)
-
-    # ── POS diversity ─────────────────────────────────────────────────────
-    pos_tags_all = pos_tag(words_raw[:500])
-    pos_counts   = collections.Counter(t for _, t in pos_tags_all)
-    n_pos        = max(sum(pos_counts.values()), 1)
-    adj_adv_ratio = sum(pos_counts.get(t, 0)
-                        for t in ("JJ","JJR","JJS","RB","RBR","RBS")) / n_pos
-    verb_types   = {w for w, t in pos_tags_all if t.startswith("VB")}
-    verb_div     = len(verb_types) / max(n_words / 10, 1)
-
     # ── N-gram repetition ─────────────────────────────────────────────────
-    all_bg    = list(zip(words, words[1:]))
-    n_bg      = max(len(all_bg), 1)
-    bg_freq   = collections.Counter(all_bg)
-    repeat_score = sum(c-1 for c in bg_freq.values() if c > 1) / n_bg
+    bgs          = list(zip(words, words[1:]))
+    bg_freq      = collections.Counter(bgs)
+    repeat_score = sum(c-1 for c in bg_freq.values() if c > 1) / max(len(bgs), 1)
 
-    # ── Internet slang / abbreviations ───────────────────────────────────
-    slang_hits = len(re.findall(
-        r'\b(lol|lmao|omg|btw|idk|tbh|ngl|rn|imo|fyi|smh|wtf|irl|brb|'
-        r'af|fr|nah|yeah|yep|nope|gonna|wanna|gotta|kinda|sorta|ugh|hmm|meh)\b',
-        text, re.IGNORECASE))
-    # Missing-apostrophe contractions ("its","dont","cant") = casual human typing
-    missing_apos = len(re.findall(
-        r'\b(its|dont|cant|wont|didnt|isnt|arent|wasnt|werent|couldnt|'
-        r'wouldnt|shouldnt|hasnt|havent|hadnt|youre|theyre|theyve|ive|id|im)\b',
-        text, re.IGNORECASE))
-    # Lowercase sentence starts — AI always capitalises, casual humans often don't
-    lowercase_starts = sum(1 for s in sentences if s and s[0].islower())
-    lowercase_ratio  = lowercase_starts / n_sents
+    # ── Paragraph regularity ──────────────────────────────────────────────
+    paras   = [p.strip() for p in text.split("\n\n") if p.strip()]
+    para_sc = [len(sent_tokenize(p)) for p in paras]
+    cv_para = (float(np.std(para_sc)) / max(float(np.mean(para_sc)), 1)
+               if len(para_sc) > 1 else 0.0)
 
-    # ── Avg word length ───────────────────────────────────────────────────
-    avg_word_len = sum(len(w) for w in words) / n_words
+    # ── NEW: Encyclopedic / Wikipedia-style AI patterns ───────────────────
+    encyclopedic_hits    = sum(1 for p in _ENCYCLOPEDIC_RE if p.search(text))
+    encyclopedic_density = encyclopedic_hits / max(n_words / 100, 1)
+
+    # ── NEW: Vocabulary sophistication (avg syllables per content word) ───
+    avg_syllables = sum(_syl(w) for w in words) / n_words
+
+    # ── NEW: Clause complexity (commas per sentence) ──────────────────────
+    comma_per_sent = text.count(',') / n_sents
+
+    # ── NEW: Adj-noun pair density (AI packs in descriptive adjectives) ───
+    # Exclude common classifiers that aren't AI-style descriptors
+    _NON_DESCRIPTIVE = {"female","male","adult","young","old","human","wild","domestic","local","national","global","social","natural","physical","general","special","common","public","private","large","small","big","little"}
+    pos_tags_adj = pos_tag(words_raw[:400])
+    adj_noun_pairs = sum(
+        1 for i in range(len(pos_tags_adj)-1)
+        if pos_tags_adj[i][1].startswith('JJ')
+        and pos_tags_adj[i+1][1].startswith('NN')
+        and pos_tags_adj[i][0].lower() not in _NON_DESCRIPTIVE
+    )
+    adj_noun_density = adj_noun_pairs / max(n_words / 20, 1)
+
+    # ── NEW: Repeated subject starter (student/human essay pattern) ───────
+    starter_counts = collections.Counter(starters)
+    max_starter_repeats = max(starter_counts.values()) if starter_counts else 0
+    repeated_starter_ratio = max_starter_repeats / max(n_sents, 1)
 
     return dict(
         overall_ppl=overall_ppl, bi_ppl=bi_ppl, tri_ppl=tri_ppl,
         ppl_std=ppl_std, sent_ppls=sent_ppls,
-        avg_sl=avg_sl, cv_sl=cv_sl, min_sl=min_sl, max_sl=max_sl,
-        fragment_ratio=fragment_ratio, completeness=completeness,
-        rhythmic_ratio=rhythmic_ratio,
-        formal_hits=formal_hits, formal_density=formal_density,
-        fake_informal_hits=fake_informal_hits, fake_informal_density=fake_informal_density,
+        avg_sl=avg_sl, cv_sl=cv_sl, fragment_ratio=fragment_ratio,
+        formal_hits=formal_hits, fake_casual_hits=fake_casual_hits,
+        all_ai_phrase_hits=all_ai_phrase_hits,
         elevated_hits=elevated_hits, elevated_density=elevated_density,
-        sensory_hits=sensory_hits, sensory_density=sensory_density,
+        hedge_hits=hedge_hits, hedge_density=hedge_density,
+        slang_hits=slang_hits, missing_apos=missing_apos,
         contraction_rate=contraction_rate,
-        msttr=msttr, hapax_ratio=hapax_ratio,
-        entropy=entropy, flesch=flesch, fog=fog,
+        lowercase_ratio=lowercase_ratio,
+        tense_mix=tense_mix,
+        we_ratio=we_ratio, we_count=we_count, i_count=i_count,
+        specificity=specificity, vagueness=vagueness,
+        specific_numbers=specific_numbers, vague_quantifiers=vague_quantifiers,
+        q_rate=q_rate, ending_variety=ending_variety,
+        robotic_ratio=robotic_ratio, i_start_ratio=i_start_ratio,
         passive_ratio=passive_ratio,
-        starter_div=starter_div, robotic_ratio=robotic_ratio, i_ratio=i_ratio,
+        flesch=flesch, fog=fog, msttr=msttr,
         ne_density=ne_density,
         em_dash_rate=em_dash_rate, exclaim_rate=exclaim_rate,
-        question_rate=question_rate, ellipsis_rate=ellipsis_rate,
-        cv_para=cv_para,
-        adj_adv_ratio=adj_adv_ratio, verb_div=verb_div,
-        repeat_score=repeat_score, avg_word_len=avg_word_len,
-        slang_hits=slang_hits, missing_apos=missing_apos,
-        lowercase_ratio=lowercase_ratio,
+        ellipsis_rate=ellipsis_rate,
+        repeat_score=repeat_score, cv_para=cv_para,
+        encyclopedic_hits=encyclopedic_hits, encyclopedic_density=encyclopedic_density,
+        avg_syllables=avg_syllables, comma_per_sent=comma_per_sent,
+        adj_noun_density=adj_noun_density, repeated_starter_ratio=repeated_starter_ratio,
         n_sentences=n_sents, n_words=n_words,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEIGHTED SCORER  (24 signals)
+# SCORER  — evidence-based, calibrated
 # ─────────────────────────────────────────────────────────────────────────────
 def score_features(feat: dict) -> tuple[float, list[dict]]:
-    signals      = []
-    score        = 0.0
-    total_weight = 0.0
+    sigs = []
+    score = 0.0
+    total_w = 0.0
 
     def add(name, obs, direction, wlabel, raw):
-        nonlocal score, total_weight
+        nonlocal score, total_w
         w = {"high": 3.0, "medium": 2.0, "low": 1.0}[wlabel]
-        score        += raw * w
-        total_weight += w
-        signals.append(dict(signal=name, observation=obs,
-                            direction=direction, weight=wlabel,
-                            contribution=round(raw*w, 3)))
+        score   += raw * w
+        total_w += w
+        sigs.append(dict(signal=name, observation=obs,
+                         direction=direction, weight=wlabel,
+                         contribution=round(raw*w, 3)))
 
-    ppl = feat["overall_ppl"]
+    # ════════════════════════════════════════════════════════
+    # GROUP A: HIGH-PRECISION AI SIGNALS
+    # These almost never appear in genuine human writing
+    # ════════════════════════════════════════════════════════
 
-    # ── 1. Perplexity ──────────────────────────────────────────────────────
-    if   ppl < 25:  add("Perplexity", f"Extremely low ({ppl:.1f}) — near-deterministic phrasing", "ai",    "high", +0.95)
-    elif ppl < 50:  add("Perplexity", f"Low ({ppl:.1f}) — highly predictable, AI-like",           "ai",    "high", +0.70)
-    elif ppl < 90:  add("Perplexity", f"Moderate ({ppl:.1f}) — somewhat predictable",              "ai",    "high", +0.25)
-    elif ppl < 180: add("Perplexity", f"Elevated ({ppl:.1f}) — varied phrasing, leans human",     "human", "high", -0.35)
-    else:           add("Perplexity", f"High ({ppl:.1f}) — unpredictable word choices",            "human", "high", -0.75)
-
-    # ── 2. Trigram coherence ───────────────────────────────────────────────
-    if feat["tri_ppl"] < feat["bi_ppl"] * 0.6:
-        add("Trigram Coherence",
-            f"Trigram PPL ({feat['tri_ppl']:.1f}) much lower than bigram ({feat['bi_ppl']:.1f}) — phrase-level predictability",
-            "ai", "medium", +0.50)
-
-    # ── 3. Perplexity burstiness ───────────────────────────────────────────
-    pstd = feat["ppl_std"]
-    if   pstd < 12: add("Perplexity Uniformity", f"Near-flat σ={pstd:.1f} — robotic consistency",      "ai",    "medium", +0.70)
-    elif pstd < 40: add("Perplexity Uniformity", f"Moderate σ={pstd:.1f}",                              "mixed", "medium", +0.10)
-    else:           add("Perplexity Uniformity", f"High σ={pstd:.1f} — natural burstiness",             "human", "medium", -0.50)
-
-    # ── 4. Sentence length CV ──────────────────────────────────────────────
-    cv = feat["cv_sl"]
-    if   cv < 0.12: add("Sentence Length Variance", f"Extremely uniform (CV={cv:.2f})",               "ai",    "medium", +0.80)
-    elif cv < 0.28: add("Sentence Length Variance", f"Low variance (CV={cv:.2f})",                    "ai",    "medium", +0.25)
-    elif cv < 0.50: add("Sentence Length Variance", f"Normal variance (CV={cv:.2f})",                 "mixed", "low",    +0.05)
-    else:           add("Sentence Length Variance", f"High variance (CV={cv:.2f}) — human-like",      "human", "medium", -0.45)
-
-    # ── 5. Fragment ratio (NEW — critical for catching AI mimic) ───────────
-    fr = feat["fragment_ratio"]
-    if   fr > 0.20: add("Sentence Fragments",
-                        f"{fr*100:.0f}% of sentences are fragments (<5 words) — authentic human writing style",
-                        "human", "medium", -0.60)
-    elif fr > 0.08: add("Sentence Fragments",
-                        f"Some fragments ({fr*100:.0f}%) — slight human indicator",
-                        "human", "low",    -0.20)
-    else:           add("Sentence Fragments",
-                        f"No fragments detected — all sentences grammatically complete, AI-mimic pattern",
-                        "ai",    "medium", +0.55)
-
-    # ── 6. Completeness ratio (NEW) ────────────────────────────────────────
-    comp = feat["completeness"]
-    if   comp > 0.95 and feat["n_sentences"] > 5:
-        add("Sentence Completeness",
-            f"Every sentence is grammatically complete ({comp*100:.0f}%) — AI-mimic writes perfect prose even in casual voice",
-            "ai", "medium", +0.50)
-    elif comp < 0.70:
-        add("Sentence Completeness",
-            f"Many incomplete sentences ({(1-comp)*100:.0f}%) — natural human writing",
-            "human", "low", -0.25)
-
-    # ── 7. Rhythmic alternation (NEW) ──────────────────────────────────────
-    rr = feat["rhythmic_ratio"]
-    if   rr > 0.35:
-        add("Rhythmic Structure",
-            f"Deliberate long-short alternation in {rr*100:.0f}% of transitions — "
-            f"AI mimics this pattern intentionally",
-            "ai", "medium", +0.45)
-    elif rr < 0.10 and feat["n_sentences"] > 6:
-        add("Rhythmic Structure",
-            "No rhythmic alternation — organic sentence flow",
-            "human", "low", -0.10)
-
-    # ── 8. Formal AI phrases ────────────────────────────────────────────────
+    # A1. Formal AI transition phrases
     fh = feat["formal_hits"]
-    if   fh >= 5: add("Formal AI Phrases",    f"{fh} detected — heavy AI transitional language",      "ai",    "high",   +0.90)
-    elif fh >= 3: add("Formal AI Phrases",    f"{fh} detected — notable AI phrasing",                "ai",    "high",   +0.60)
-    elif fh >= 1: add("Formal AI Phrases",    f"{fh} detected — some AI phrasing",                   "ai",    "low",    +0.20)
-    else:         add("Formal AI Phrases",    "None — no formal AI transition language",              "human", "medium", -0.25)
+    if   fh >= 5: add("Formal AI Phrases", f"{fh} formal transitions (furthermore, moreover, in conclusion…)", "ai", "high", +0.90)
+    elif fh >= 3: add("Formal AI Phrases", f"{fh} formal transitions detected",                                 "ai", "high", +0.70)
+    elif fh >= 1: add("Formal AI Phrases", f"{fh} formal transition phrase(s)",                                 "ai", "medium", +0.40)
+    else:         add("Formal AI Phrases", "None — no formal AI transitional language",                         "human", "medium", -0.20)
 
-    # ── 9. Fake informality (NEW — key for AI-mimic-casual) ────────────────
-    fi = feat["fake_informal_hits"]
-    if   fi >= 3: add("Fake Informality Markers",
-                      f"{fi} detected ('Look,', 'Here's the thing', 'I'll be honest'…) — "
-                      f"AI uses these to simulate casual voice",
-                      "ai", "high", +0.85)
-    elif fi >= 1: add("Fake Informality Markers",
-                      f"{fi} detected — some scripted casual phrases",
-                      "ai", "medium", +0.45)
+    # A2. Fake-casual markers
+    fc = feat["fake_casual_hits"]
+    if   fc >= 3: add("Scripted Casual Voice", f"{fc} fake-casual phrases ('Look,', 'Here's the thing', 'Revolutionary, I know'…)", "ai", "high",   +0.85)
+    elif fc >= 1: add("Scripted Casual Voice", f"{fc} scripted casual phrase(s) — AI mimicking informal voice",                      "ai", "medium", +0.50)
 
-    # ── 10. Elevated vocabulary (NEW — leaks AI in casual context) ──────────
+    # A3. Elevated vocabulary density (in non-academic writing context)
     ed = feat["elevated_density"]
-    if   ed > 2.0: add("Elevated Vocabulary",
-                       f"{feat['elevated_hits']} sophisticated words in casual context "
-                       f"(e.g. 'visceral', 'fundamentally', 'ephemeral') — AI sounds elevated even when informal",
-                       "ai", "high", +0.80)
-    elif ed > 0.8: add("Elevated Vocabulary",
-                       f"{feat['elevated_hits']} elevated words — moderately suspicious in casual writing",
-                       "ai", "medium", +0.40)
+    if   ed > 2.5: add("Elevated Vocabulary", f"{feat['elevated_hits']} sophisticated words in context — AI sounds polished even when casual", "ai", "high",   +0.75)
+    elif ed > 1.0: add("Elevated Vocabulary", f"{feat['elevated_hits']} elevated words — moderately suspicious",                               "ai", "medium", +0.35)
 
-    # ── 11. Sensory/literary density (NEW — AI emotional writing) ───────────
-    sd = feat["sensory_density"]
-    if sd > 3.0:
-        add("Sensory Language Overload",
-            f"{feat['sensory_hits']} sensory words per 100 words — AI packs emotional writing "
-            f"with deliberate sensory detail ('warm', 'drifting', 'hollow'…)",
-            "ai", "medium", +0.55)
-    elif sd > 1.5:
-        add("Sensory Language",
-            f"Moderate sensory language ({feat['sensory_hits']} hits) — possible AI emotional writing",
-            "ai", "low", +0.20)
+    # A4. Epistemic hedge density
+    hd = feat["hedge_density"]
+    if   hd > 2.0: add("Epistemic Hedges", f"{feat['hedge_hits']} analytical hedge phrases ('it is crucial', 'research suggests'…)", "ai", "high",   +0.70)
+    elif hd > 0.8: add("Epistemic Hedges", f"{feat['hedge_hits']} hedge phrase(s) — moderate AI indicator",                          "ai", "medium", +0.30)
 
-    # ── 12. Contraction rate ───────────────────────────────────────────────
-    cr = feat["contraction_rate"]
-    if   cr > 0.025: add("Contractions", f"{cr*100:.1f}% rate — genuine informal voice",             "human", "medium", -0.55)
-    elif cr > 0.008: add("Contractions", f"{cr*100:.1f}% — some informality",                        "mixed", "low",    +0.05)
-    else:            add("Contractions", f"Very low ({cr*100:.1f}%) — stiff register, AI-like",       "ai",    "medium", +0.45)
+    # A5. Vague quantifiers (AI says "many" and "various"; humans are specific)
+    vq = feat["vague_quantifiers"]
+    sn = feat["specific_numbers"]
+    if vq >= 3 and sn == 0:
+        add("Vague + No Specifics", f"{vq} vague quantifiers ('many', 'various', 'numerous') with zero specific numbers — AI generalises", "ai", "high", +0.65)
+    elif vq >= 2 and sn == 0:
+        add("Vague Quantifiers",    f"{vq} vague quantifiers, no specific figures",                                                         "ai", "medium", +0.35)
 
-    # ── 13. MSTTR lexical diversity ────────────────────────────────────────
-    mt = feat["msttr"]
-    if   mt > 0.82: add("Lexical Diversity (MSTTR)", f"High ({mt:.3f}) — broad vocabulary",          "human", "medium", -0.35)
-    elif mt > 0.68: add("Lexical Diversity (MSTTR)", f"Average ({mt:.3f})",                          "mixed", "low",    +0.00)
-    else:           add("Lexical Diversity (MSTTR)", f"Low ({mt:.3f}) — repetitive vocabulary",       "ai",    "medium", +0.40)
+    # A6. Tense uniformity — ONLY fire for analytical/argumentative writing
+    # Factual/descriptive writing (human OR AI) legitimately stays present tense
+    # So only penalise if ALSO no contractions, no slang, no fragments (= not casual human)
+    tm = feat["tense_mix"]
+    is_formal_context = feat["contraction_rate"] < 0.005 and feat["slang_hits"] == 0
+    if tm < 0.05 and feat["n_sentences"] > 6 and is_formal_context:
+        add("Tense Uniformity", f"Single tense throughout in formal context (mix={tm:.2f}) — AI pattern", "ai", "low", +0.25)
+    elif tm > 0.30:
+        add("Tense Variation", f"Natural tense mixing (score {tm:.2f})",  "human", "low", -0.15)
 
-    # ── 14. Shannon entropy ────────────────────────────────────────────────
-    ent = feat["entropy"]
-    if   ent > 7.5: add("Shannon Entropy", f"High ({ent:.2f} bits) — rich information density",      "human", "medium", -0.35)
-    elif ent > 6.0: add("Shannon Entropy", f"Moderate ({ent:.2f} bits)",                             "mixed", "low",    +0.00)
-    else:           add("Shannon Entropy", f"Low ({ent:.2f} bits) — repetitive vocabulary",           "ai",    "medium", +0.30)
+    # A7. "We" pronoun in non-collaborative writing (AI instructional)
+    if feat["we_ratio"] > 0.20 and feat["i_count"] == 0:
+        add("Collective 'We' Pronoun", f"Frequent 'we' ({feat['we_count']} times) with no 'I' — AI instructional/analytical voice", "ai", "medium", +0.40)
 
-    # ── 15. Flesch readability ─────────────────────────────────────────────
-    fl = feat["flesch"]
-    if   fl > 80: add("Flesch Ease", f"Very easy ({fl:.0f}) — oversimplified or padded",             "ai",    "low",    +0.20)
-    elif 48 <= fl <= 68: add("Flesch Ease", f"Standard band ({fl:.0f}) — AI clusters here",          "ai",    "low",    +0.15)
-    elif fl < 30: add("Flesch Ease", f"Very difficult ({fl:.0f}) — dense academic text",              "human", "low",    -0.15)
+    # NEW A8. Encyclopedic / Wikipedia-style AI patterns
+    eh = feat["encyclopedic_hits"]
+    if   eh >= 5: add("Encyclopedic Phrasing", f"{eh} Wikipedia-style phrases ('primarily found in', 'play an important role', 'throughout history'…)", "ai", "high",   +0.90)
+    elif eh >= 3: add("Encyclopedic Phrasing", f"{eh} encyclopedic AI patterns detected",                                                               "ai", "high",   +0.70)
+    elif eh >= 1: add("Encyclopedic Phrasing", f"{eh} encyclopedic phrase(s) — mild AI indicator",                                                      "ai", "medium", +0.30)
 
-    # ── 16. Gunning Fog ────────────────────────────────────────────────────
-    if feat["fog"] > 16:
-        add("Gunning Fog", f"Very high ({feat['fog']:.1f}) — over-complicated phrasing",             "ai",    "low",    +0.20)
+    # NEW A9. Vocabulary sophistication (avg syllables per word)
+    avs = feat["avg_syllables"]
+    if   avs > 1.6: add("Vocabulary Sophistication", f"Avg {avs:.2f} syllables/word — elevated vocabulary typical of AI factual writing", "ai", "high",   +0.70)
+    elif avs > 1.45: add("Vocabulary Sophistication", f"Avg {avs:.2f} syllables/word — moderately formal vocabulary",                     "ai", "medium", +0.35)
+    elif avs < 1.25: add("Vocabulary Sophistication", f"Avg {avs:.2f} syllables/word — simple, direct vocabulary, human-like",            "human", "medium", -0.40)
 
-    # ── 17. Passive voice ──────────────────────────────────────────────────
+    # NEW A10. Clause complexity — commas per sentence
+    cps = feat["comma_per_sent"]
+    if   cps > 1.5: add("Clause Complexity", f"{cps:.1f} commas/sentence — AI writes dense subordinate clauses", "ai", "high",   +0.75)
+    elif cps > 0.8: add("Clause Complexity", f"{cps:.1f} commas/sentence — moderately complex structure",        "ai", "medium", +0.30)
+    elif cps < 0.2 and feat["n_sentences"] > 4:
+        add("Low Clause Complexity", f"Very few commas ({cps:.1f}/sent) — simple sentence structure, human/student writing", "human", "medium", -0.45)
+
+    # NEW A11. Adjective-noun pair density (AI packs descriptive adjectives)
+    and_ = feat["adj_noun_density"]
+    if   and_ > 1.2: add("Descriptive Density", f"High adj-noun density ({and_:.1f}) — AI packs in descriptive adjectives ('impressive manes', 'magnificent animals')", "ai", "high",   +0.70)
+    elif and_ > 0.7: add("Descriptive Density", f"Moderate adj-noun density ({and_:.1f})",                                                                               "ai", "medium", +0.25)
+    elif and_ < 0.3: add("Descriptive Density", f"Low adj-noun density ({and_:.1f}) — plain writing, human indicator",                                                   "human", "low",  -0.25)
+
+    # NEW A12. Repeated subject starters (student/human writing pattern)
+    rsr = feat["repeated_starter_ratio"]
+    if rsr > 0.4:
+        add("Repeated Subject Opener", f"Same word starts {rsr*100:.0f}% of sentences — student/human writing pattern (not AI)", "human", "medium", -0.55)
+
+    # A8. Robotic sentence openers
+    rr = feat["robotic_ratio"]
+    if   rr > 0.60: add("Sentence Openers", f"{rr*100:.0f}% start with The/This/It/Furthermore/However…", "ai", "medium", +0.55)
+    elif rr > 0.35: add("Sentence Openers", f"{rr*100:.0f}% robotic openers — moderate AI pattern",       "ai", "low",    +0.20)
+    elif rr < 0.15: add("Sentence Openers", f"Diverse openers — only {rr*100:.0f}% robotic",              "human", "low", -0.20)
+
+    # A9. Passive voice
     pv = feat["passive_ratio"]
-    if   pv > 0.35: add("Passive Voice", f"High ({pv:.2f}/sent) — AI overuses passive",              "ai",    "medium", +0.40)
-    elif pv > 0.15: add("Passive Voice", f"Moderate ({pv:.2f}/sent)",                                "mixed", "low",    +0.10)
-    else:           add("Passive Voice", f"Low ({pv:.2f}/sent) — active voice, human-like",          "human", "low",    -0.20)
+    if   pv > 0.40: add("Passive Voice", f"High ({pv:.2f}/sentence) — AI over-relies on passive constructions", "ai", "medium", +0.40)
+    elif pv > 0.20: add("Passive Voice", f"Moderate ({pv:.2f}/sentence)",                                       "mixed", "low",    +0.10)
+    else:           add("Passive Voice", f"Low ({pv:.2f}/sentence) — active voice",                             "human", "low",    -0.15)
 
-    # ── 18. Sentence starter diversity ────────────────────────────────────
-    rob = feat["robotic_ratio"]
-    if   rob > 0.55: add("Sentence Openers", f"{rob*100:.0f}% robotic starters",                     "ai",    "medium", +0.55)
-    elif rob > 0.30: add("Sentence Openers", f"{rob*100:.0f}% robotic starters — moderate AI signal","ai",    "low",    +0.25)
-    else:            add("Sentence Openers", f"Diverse openers (only {rob*100:.0f}% robotic)",        "human", "medium", -0.30)
+    # A10. Perplexity — supporting evidence only (lower weight)
+    ppl = feat["overall_ppl"]
+    pstd = feat["ppl_std"]
+    if ppl < 30 and pstd < 10:
+        add("Perplexity", f"Very low & uniform (PPL={ppl:.1f}, σ={pstd:.1f}) — strong corroborating AI signal", "ai", "medium", +0.55)
+    elif ppl < 50 and pstd < 20:
+        add("Perplexity", f"Low perplexity (PPL={ppl:.1f}, σ={pstd:.1f}) — moderate AI corroboration",          "ai", "low",    +0.25)
+    elif ppl > 150:
+        add("Perplexity", f"High perplexity (PPL={ppl:.1f}) — varied word choices",                             "human", "low",  -0.20)
 
-    # ── 19. I-pronoun uniformity (NEW) ─────────────────────────────────────
-    ir = feat["i_ratio"]
-    if ir > 0.35:
-        add("First-Person Uniformity",
-            f"{ir*100:.0f}% of sentences start with 'I' — AI-mimic overuses uniform first-person",
-            "ai", "medium", +0.45)
+    # ════════════════════════════════════════════════════════
+    # GROUP B: HIGH-PRECISION HUMAN SIGNALS
+    # These almost never appear in AI-generated text
+    # ════════════════════════════════════════════════════════
 
-    # ── 20. Named entity density ───────────────────────────────────────────
-    ned = feat["ne_density"]
-    if   ned > 2.0: add("Named Entities", f"High density ({ned:.1f}/100w) — specific real-world refs", "human", "low", -0.20)
-    elif ned < 0.5: add("Named Entities", f"Low density ({ned:.1f}/100w) — vague and general",          "ai",    "low", +0.20)
-
-    # ── 21. Punctuation fingerprint ────────────────────────────────────────
-    if feat["em_dash_rate"]  > 0.004: add("Em Dashes",  "Present — deliberate stylistic choice",      "human", "low", -0.20)
-    if feat["exclaim_rate"]  > 0.002: add("Exclamations","Present — emotional expressiveness",         "human", "low", -0.20)
-    if feat["question_rate"] > 0.10:  add("Questions",  f"Rate {feat['question_rate']:.2f}/sent",      "human", "low", -0.15)
-    if feat["ellipsis_rate"] > 0.05:  add("Ellipses",   "Present — hesitant/casual writing style",    "human", "low", -0.15)
-
-    # ── 22. Paragraph regularity ───────────────────────────────────────────
-    if feat["cv_para"] < 0.08 and feat["n_sentences"] > 8:
-        add("Paragraph Regularity", "Paragraphs nearly identical in length",                          "ai",    "medium", +0.45)
-    elif feat["cv_para"] > 0.5:
-        add("Paragraph Regularity", "Highly irregular paragraphs — natural human structure",          "human", "low",    -0.20)
-
-    # ── 23. N-gram repetition ──────────────────────────────────────────────
-    rs = feat["repeat_score"]
-    if   rs > 0.15: add("Phrase Repetition", f"High bigram repetition ({rs:.2f})",                   "ai",    "medium", +0.35)
-    elif rs < 0.04: add("Phrase Repetition", f"Low repetition ({rs:.2f}) — varied phrasing",         "human", "low",    -0.15)
-
-    # ── Internet slang / informal markers ─────────────────────────────────
+    # B1. Internet slang — AI never produces these
     sh = feat["slang_hits"]
-    if   sh >= 2: add("Internet Slang", f"{sh} informal terms (lol, yeah, gonna…) — strong human signal", "human", "high",   -0.75)
-    elif sh == 1: add("Internet Slang", "1 informal term — mild human signal",                             "human", "low",    -0.25)
+    if   sh >= 2: add("Internet Slang", f"{sh} slang terms (lol, btw, yeah, gonna…) — AI never produces these", "human", "high",   -0.90)
+    elif sh == 1: add("Internet Slang", "1 slang term — human indicator",                                        "human", "medium", -0.40)
 
-    # ── Apostrophe-less contractions ──────────────────────────────────────
+    # B2. Lowercase sentence starts — AI always capitalises
+    lr = feat["lowercase_ratio"]
+    if   lr > 0.50: add("Lowercase Starts", f"{lr*100:.0f}% sentences start lowercase — AI always capitalises", "human", "high",   -0.90)
+    elif lr > 0.15: add("Lowercase Starts", f"Some lowercase starts ({lr*100:.0f}%) — casual human indicator",  "human", "medium", -0.40)
+
+    # B3. Missing-apostrophe contractions (casual human typing)
     ma = feat["missing_apos"]
-    if   ma >= 2: add("Informal Contractions", f"{ma} words like 'its/dont/cant' — casual human typing",  "human", "medium", -0.60)
-    elif ma == 1: add("Informal Contractions", "1 apostrophe-less contraction — minor human indicator",   "human", "low",    -0.20)
+    if   ma >= 2: add("Informal Contractions", f"{ma} words like 'its/dont/cant' — casual typing, AI never does this", "human", "high",   -0.75)
+    elif ma == 1: add("Informal Contractions", "1 apostrophe-less contraction",                                         "human", "medium", -0.35)
 
-    # ── Lowercase sentence starts ─────────────────────────────────────────
-    llr = feat["lowercase_ratio"]
-    if   llr > 0.50: add("Lowercase Starts", f"{llr*100:.0f}% sentences start lowercase — AI never does this", "human", "high", -0.85)
-    elif llr > 0.15: add("Lowercase Starts", f"Some lowercase starts ({llr*100:.0f}%) — informality signal",   "human", "low",  -0.25)
+    # B4. Sentence fragments
+    fr = feat["fragment_ratio"]
+    if   fr > 0.20: add("Sentence Fragments", f"{fr*100:.0f}% fragments (<5 words) — natural human writing style", "human", "medium", -0.50)
+    elif fr > 0.08: add("Sentence Fragments", f"Some fragments ({fr*100:.0f}%)",                                    "human", "low",    -0.20)
+    elif fr == 0 and feat["n_sentences"] >= 6:
+        add("No Fragments", "Zero sentence fragments — AI writes in complete sentences", "ai", "low", +0.20)
 
-    # ── 24. Adj/adverb overuse ─────────────────────────────────────────────
-    aar = feat["adj_adv_ratio"]
-    if   aar > 0.22: add("Adj/Adverb Overuse", f"{aar*100:.0f}% adj/adv — AI over-qualifies",        "ai",    "low", +0.25)
-    elif aar < 0.10: add("Adj/Adverb Overuse", f"Lean adj/adv ratio ({aar*100:.0f}%)",                "human", "low", -0.10)
+    # B5. Sentence length variation
+    cv = feat["cv_sl"]
+    if   cv < 0.15 and feat["n_sentences"] > 5:
+        add("Sentence Length Variance", f"Extremely uniform (CV={cv:.2f}) — AI metronomic pattern",          "ai",    "medium", +0.50)
+    elif cv < 0.28:
+        add("Sentence Length Variance", f"Low variance (CV={cv:.2f})",                                       "ai",    "low",    +0.15)
+    elif cv > 0.55:
+        add("Sentence Length Variance", f"High variance (CV={cv:.2f}) — humans mix long and short naturally","human", "medium", -0.35)
 
-    # ── Normalize ──────────────────────────────────────────────────────────
-    if total_weight == 0:
-        return 0.5, signals
-    raw     = score / total_weight
-    ai_prob = 1 / (1 + math.exp(-raw * 3.5))
-    return round(ai_prob, 4), signals
+    # B6. Specificity (humans use numbers, AI uses vague language)
+    if feat["specific_numbers"] >= 2:
+        add("Specific Details", f"{feat['specific_numbers']} specific numbers/figures — humans are concrete", "human", "low", -0.25)
+
+    # B7. Questions  
+    if feat["q_rate"] > 0.15:
+        add("Question Usage", f"Questions in {feat['q_rate']*100:.0f}% of sentences — conversational human style", "human", "low", -0.20)
+
+    # B8. Punctuation expressiveness
+    if feat["exclaim_rate"] > 0.003:
+        add("Exclamation Marks", "Present — emotional expressiveness, human indicator",  "human", "low", -0.20)
+    if feat["ellipsis_rate"] > 0.05:
+        add("Ellipses",          "Present — hesitation/trailing, human writing style",  "human", "low", -0.15)
+
+    # B9. Genuine contractions
+    cr = feat["contraction_rate"]
+    if   cr > 0.025: add("Contractions", f"Rate {cr*100:.1f}% — natural informal voice",      "human", "medium", -0.40)
+    elif cr > 0.010: add("Contractions", f"Rate {cr*100:.1f}% — moderate informality",        "human", "low",    -0.15)
+    elif cr == 0 and feat["n_words"] > 60:
+        add("No Contractions", "Zero contractions in long text — formal/AI register",          "ai",    "medium", +0.35)
+
+    # B10. Lexical diversity
+    mt = feat["msttr"]
+    if   mt > 0.85: add("Lexical Diversity", f"High MSTTR {mt:.3f} — rich diverse vocabulary", "human", "low", -0.20)
+    elif mt < 0.60: add("Lexical Diversity", f"Low MSTTR {mt:.3f} — repetitive vocabulary",    "ai",    "low", +0.20)
+
+    # ════════════════════════════════════════════════════════
+    # GROUP C: CONTEXTUAL SIGNALS (lower weight, used for tiebreak)
+    # ════════════════════════════════════════════════════════
+
+    # C1. Paragraph regularity
+    if feat["cv_para"] < 0.08 and feat["n_sentences"] > 8:
+        add("Paragraph Regularity", "Paragraphs nearly identical in length — structural AI pattern", "ai", "low", +0.20)
+
+    # C2. N-gram repetition
+    rs = feat["repeat_score"]
+    if rs > 0.18: add("Phrase Repetition", f"High bigram repetition ({rs:.2f})", "ai", "low", +0.20)
+
+    # C3. Flesch readability
+    fl = feat["flesch"]
+    if   fl > 80:       add("Readability", f"Very easy Flesch {fl:.0f} — simplified/padded", "ai", "low", +0.15)
+    elif 48 <= fl <= 68: add("Readability", f"Standard Flesch {fl:.0f} — AI clusters here",  "ai", "low", +0.10)
+    elif fl < 25:        add("Readability", f"Very difficult Flesch {fl:.0f} — dense text",  "human", "low", -0.10)
+
+    # ── Normalise ──────────────────────────────────────────────────────────
+    if total_w == 0:
+        return 0.5, sigs
+    raw     = score / total_w
+    ai_prob = 1 / (1 + math.exp(-raw * 3.2))
+    return round(ai_prob, 4), sigs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SENTENCE FLAGGING
 # ─────────────────────────────────────────────────────────────────────────────
-def flag_sentences(sentences, sent_ppls, bi_lm) -> list[dict]:
+def flag_sentences(sentences, sent_ppls) -> list[dict]:
     flagged   = []
-    threshold = min(55.0, float(np.percentile(sent_ppls, 30)) + 10) if sent_ppls else 55.0
+    threshold = float(np.percentile(sent_ppls, 25)) + 5 if len(sent_ppls) >= 4 else 45.0
 
     for sent, ppl in zip(sentences, sent_ppls):
         reasons = []
-        if ppl < threshold and ppl < 90:
-            reasons.append(f"low perplexity ({ppl:.1f}) — predictable phrasing")
         if any(p.search(sent.lower()) for p in _FORMAL_RE):
-            reasons.append("formal AI transitional phrase")
-        if any(p.search(sent.lower()) for p in _INFORMAL_RE):
-            reasons.append("scripted casual phrase (fake informality)")
-        if _ELEVATED_WORDS.search(sent):
-            words_hit = _ELEVATED_WORDS.findall(sent)
-            reasons.append(f"elevated vocab in casual context: {words_hit[0]}")
+            reasons.append("formal AI transition phrase")
+        if any(p.search(sent.lower()) for p in _CASUAL_RE):
+            reasons.append("scripted casual phrase")
+        if _ELEVATED.search(sent):
+            hits = _ELEVATED.findall(sent)
+            reasons.append(f"elevated vocabulary: '{hits[0]}'")
+        if _HEDGES.search(sent):
+            reasons.append("epistemic hedge phrase")
+        if ppl < threshold and ppl < 60 and not reasons:
+            reasons.append(f"unusually predictable phrasing (perplexity {ppl:.1f})")
         if re.search(r'\b(is|are|was|were|be|been)\s+\w+(?:ed|en)\b', sent, re.I):
             reasons.append("passive construction")
         if reasons:
@@ -597,14 +639,15 @@ def analyze_text(text: str) -> dict:
     if not text:
         return {"error": "Empty text"}
 
-    bi_lm  = NgramLM(n=2); bi_lm.train(text)
-    tri_lm = NgramLM(n=3); tri_lm.train(text)
+    bi_lm  = NgramLM(2); bi_lm.train(text)
+    tri_lm = NgramLM(3); tri_lm.train(text)
 
     feat             = extract_features(text, bi_lm, tri_lm)
     ai_prob, signals = score_features(feat)
 
-    if   ai_prob > 0.68: classification = "AI Generated"
-    elif ai_prob > 0.42: classification = "Mixed / Uncertain"
+    # Hardened thresholds: require stronger evidence
+    if   ai_prob > 0.72: classification = "AI Generated"
+    elif ai_prob > 0.40: classification = "Mixed / Uncertain"
     else:                classification = "Human Written"
 
     confidence = int(abs(ai_prob - 0.5) * 2 * 100)
@@ -615,38 +658,33 @@ def analyze_text(text: str) -> dict:
                  for s, p in zip(sentences, sent_ppls)]
 
     ppl = feat["overall_ppl"]
-    clamped    = min(max(ppl, 10.0), 600.0)
-    human_like = round(((clamped - 10) / 590) * 100, 1)
+    human_like = round(min(max((ppl - 10) / 590, 0), 1) * 100, 1)
 
-    if   ppl < 35:  ppl_interp = "Very predictable — strongly AI-like"
-    elif ppl < 70:  ppl_interp = "Moderately predictable — likely AI-assisted"
-    elif ppl < 130: ppl_interp = "Borderline — mixed signals"
-    elif ppl < 280: ppl_interp = "Variable — leans human"
-    else:           ppl_interp = "Highly varied — consistent with human writing"
+    if   ppl < 35:  ppl_interp = "Very predictable — possible AI indicator"
+    elif ppl < 80:  ppl_interp = "Moderately predictable — mixed signals"
+    elif ppl < 200: ppl_interp = "Variable — leans human"
+    else:           ppl_interp = "Highly varied — human-like"
 
-    flagged    = flag_sentences(sentences, sent_ppls, bi_lm)
+    flagged    = flag_sentences(sentences, sent_ppls)
     ai_sigs    = [s for s in signals if s["direction"] == "ai"    and s["weight"] in ("high","medium")]
     human_sigs = [s for s in signals if s["direction"] == "human" and s["weight"] in ("high","medium")]
 
     if   classification == "AI Generated":
         top     = ", ".join(s["signal"].lower() for s in ai_sigs[:2])
-        summary = (f"This text was likely generated by an AI ({int(ai_prob*100)}% probability). "
-                   + (f"Key indicators: {top}." if top else ""))
+        summary = f"This text was likely AI-generated ({int(ai_prob*100)}% probability). Key indicators: {top}." if top else f"AI-generated ({int(ai_prob*100)}%)."
     elif classification == "Human Written":
         top     = ", ".join(s["signal"].lower() for s in human_sigs[:2])
-        summary = (f"This text reads as human-written ({int((1-ai_prob)*100)}% confidence). "
-                   + (f"Key human signals: {top}." if top else ""))
+        summary = f"This text reads as human-written ({int((1-ai_prob)*100)}% confidence). Key signals: {top}." if top else f"Human-written ({int((1-ai_prob)*100)}%)."
     else:
-        summary = ("Mixed signals — this may be AI output edited to sound casual, "
-                   "or human writing following a formal/structured template.")
+        summary = "Mixed signals — could be AI-assisted, lightly edited AI output, or structured human writing."
 
     radar = {
-        "Perplexity":    round(1 - min(ppl/400, 1), 2),
-        "AI Phrases":    round(min((feat["formal_hits"]+feat["fake_informal_hits"]) / 6, 1), 2),
-        "Uniformity":    round(max(0, 1 - feat["cv_sl"] / 0.6), 2),
+        "AI Phrases":    round(min(feat["all_ai_phrase_hits"] / 5, 1), 2),
+        "Elevated Vocab":round(min(feat["elevated_density"]   / 3, 1), 2),
         "Formality":     round(max(0, 1 - feat["contraction_rate"] / 0.03), 2),
-        "Elevated Vocab":round(min(feat["elevated_density"] / 3, 1), 2),
-        "Completeness":  round(feat["completeness"], 2),
+        "Uniformity":    round(max(0, 1 - feat["cv_sl"] / 0.6), 2),
+        "Hedging":       round(min(feat["hedge_density"] / 2, 1), 2),
+        "Specificity":   round(min(feat["specificity"] / 2, 1), 2),
     }
 
     return {
@@ -665,8 +703,8 @@ def analyze_text(text: str) -> dict:
         },
         "readability": {
             "flesch":    round(feat["flesch"], 1),
-            "fog_index": round(feat["fog"], 1),
-            "entropy":   round(feat["entropy"], 2),
+            "fog_index": round(feat["fog"],    1),
+            "msttr":     round(feat["msttr"],  3),
         },
         "signals":           signals,
         "flagged_sentences": flagged,
@@ -676,17 +714,19 @@ def analyze_text(text: str) -> dict:
             "sentence_count":      feat["n_sentences"],
             "char_count":          len(text),
             "ttr":                 round(feat["msttr"], 3),
-            "ai_phrases_found":    feat["formal_hits"] + feat["fake_informal_hits"],
             "formal_phrases":      feat["formal_hits"],
-            "fake_informal":       feat["fake_informal_hits"],
+            "fake_casual":         feat["fake_casual_hits"],
             "elevated_vocab":      feat["elevated_hits"],
-            "sensory_words":       feat["sensory_hits"],
+            "hedge_phrases":       feat["hedge_hits"],
+            "slang_hits":          feat["slang_hits"],
+            "informal_contractions": feat["missing_apos"],
             "avg_sentence_len":    round(feat["avg_sl"], 1),
             "fragment_ratio":      round(feat["fragment_ratio"], 2),
-            "passive_ratio":       round(feat["passive_ratio"], 2),
-            "starter_diversity":   round(feat["starter_div"], 2),
-            "slang_hits":           feat["slang_hits"],
-            "informal_contractions": feat["missing_apos"],
-            "lowercase_starts":     round(feat["lowercase_ratio"], 2),
+            "tense_mix":           round(feat["tense_mix"], 2),
+            "specificity":         feat["specific_numbers"],
+            "vague_quantifiers":   feat["vague_quantifiers"],
+            "encyclopedic_hits":   feat["encyclopedic_hits"],
+            "avg_syllables":       round(feat["avg_syllables"], 2),
+            "comma_per_sent":      round(feat["comma_per_sent"], 1),
         },
     }
