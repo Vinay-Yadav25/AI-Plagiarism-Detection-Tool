@@ -402,41 +402,6 @@ def full_results(R, label=""):
             unsafe_allow_html=True)
         render_signals_panel(R["signals"])
 
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-
-    # Flagged sentences
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:16px;
-        font-weight:600;color:#E2E8F0;margin-bottom:10px;">🚩 Flagged Sentences</div>""",
-        unsafe_allow_html=True)
-    render_flagged(R["flagged_sentences"])
-
-    # Highlighted doc
-    with st.expander("📄 Full Text with Highlights"):
-        safe = _html.escape(R.get("_input_text","")).replace("\n","<br>")
-        for fs in R["flagged_sentences"]:
-            orig = _html.escape(fs["text"])
-            if orig in safe:
-                safe = safe.replace(orig,
-                    f'<mark style="background:#3A1010;color:#EF9090;border-radius:3px;padding:0 2px;">{orig}</mark>',1)
-        st.markdown(f"""
-        <div style="background:#131929;border:1px solid #2A3550;border-radius:12px;
-            padding:18px 20px;font-size:13px;color:#CBD5E1;line-height:1.8;
-            max-height:340px;overflow-y:auto;">{safe}</div>""", unsafe_allow_html=True)
-
-    # Export
-    report_txt = make_report(R, label)
-    b64 = base64.b64encode(report_txt.encode()).decode()
-    st.markdown(
-        f'<a href="data:file/txt;base64,{b64}" download="textguard_report.txt" '
-        f'style="display:inline-block;background:#1C2438;border:1px solid #2A3550;'
-        f'color:#818CF8;padding:8px 18px;border-radius:8px;font-size:13px;'
-        f'text-decoration:none;font-family:Space Grotesk,sans-serif;margin-top:8px;">'
-        f'📥 Download Report</a>', unsafe_allow_html=True)
-
-    with st.expander("🔧 Raw JSON"):
-        display_R = {k: v for k, v in R.items() if k != "_input_text"}
-        st.json(display_R)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HERO
@@ -633,10 +598,3 @@ else:
                 <tbody>{rows}</tbody>
               </table>
             </div>""", unsafe_allow_html=True)
-
-            # ── Full drill-downs ──────────────────────────────────────────
-            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-            with st.expander("📂 Full Analysis — Text A"):
-                full_results(Ra, "Text A")
-            with st.expander("📂 Full Analysis — Text B"):
-                full_results(Rb, "Text B")
