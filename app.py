@@ -14,7 +14,7 @@ if _ROOT not in sys.path:
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="TextGuard — AI Detection",
+    page_title="AI Detection Tool",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -69,7 +69,7 @@ with st.sidebar:
     st.markdown("""
     <div style="padding:20px 4px 12px;">
         <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;color:#E2E8F0;">
-            🛡️ TextGuard
+            🛡️ AI Dectection Tool
         </div>
         <div style="font-size:11px;color:#94A3B8;margin-top:2px;">AI Detection & Analysis v2</div>
     </div>""", unsafe_allow_html=True)
